@@ -32,6 +32,12 @@ async function initWA() {
 
 async function bootstrap() {
   const logger = new Logger('SERVER');
+  const apiKey = configService.get<Auth>('AUTHENTICATION').API_KEY.KEY;
+  if (process.env.DOCKER_ENV === 'true' && !apiKey.trim()) {
+    logger.error('AUTHENTICATION_API_KEY must be set before starting the Docker deployment.');
+    process.exit(1);
+  }
+
   const app = express();
 
   let providerFiles: ProviderFiles = null;
@@ -67,8 +73,6 @@ async function bootstrap() {
   app.set('view engine', 'hbs');
   app.set('views', join(ROOT_DIR, 'views'));
   app.use(express.static(join(ROOT_DIR, 'public')));
-
-  app.use('/store', express.static(join(ROOT_DIR, 'store')));
 
   app.use('/', router);
 
@@ -157,7 +161,11 @@ async function bootstrap() {
     Sentry.setupExpressErrorHandler(app);
   }
 
-  server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
+  const defaultServerHost = process.env.DOCKER_ENV === 'true' ? '0.0.0.0' : '127.0.0.1';
+  const serverHost = process.env.SERVER_HOST || defaultServerHost;
+  server.listen(httpServer.PORT, serverHost, () =>
+    logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + serverHost + ':' + httpServer.PORT),
+  );
 
   initWA().catch((error) => {
     logger.error('Error loading instances: ' + error);

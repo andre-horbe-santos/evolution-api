@@ -48,14 +48,13 @@ const packageJson = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
 const metricsIPWhitelist = (req: Request, res: Response, next: NextFunction) => {
   const metricsConfig = configService.get('METRICS');
   const allowedIPs = metricsConfig.ALLOWED_IPS?.split(',').map((ip) => ip.trim()) || ['127.0.0.1'];
-  const clientIPs = [
-    req.ip,
-    req.connection.remoteAddress,
-    req.socket.remoteAddress,
-    req.headers['x-forwarded-for'],
-  ].filter((ip) => ip !== undefined);
+  const clientIPs = [req.ip, req.socket.remoteAddress]
+    .filter((ip): ip is string => Boolean(ip))
+    .map((ip) => (ip.startsWith('::ffff:') ? ip.slice('::ffff:'.length) : ip));
 
-  if (allowedIPs.filter((ip) => clientIPs.includes(ip)) === 0) {
+  const normalizedAllowedIPs = allowedIPs.map((ip) => (ip.startsWith('::ffff:') ? ip.slice('::ffff:'.length) : ip));
+
+  if (!normalizedAllowedIPs.some((ip) => clientIPs.includes(ip))) {
     return res.status(403).send('Forbidden: IP not allowed');
   }
 
@@ -91,6 +90,10 @@ const metricsBasicAuth = (req: Request, res: Response, next: NextFunction) => {
 // Expose Prometheus metrics when enabled by env flag
 const metricsConfig = configService.get('METRICS');
 if (metricsConfig.ENABLED) {
+  if (!metricsConfig.AUTH_REQUIRED && !metricsConfig.ALLOWED_IPS) {
+    throw new Error('Metrics are enabled without protection; configure Basic Auth or METRICS_ALLOWED_IPS.');
+  }
+
   const metricsMiddleware = [];
 
   // Add IP whitelist if configured

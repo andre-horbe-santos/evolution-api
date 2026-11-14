@@ -861,12 +861,12 @@ export class ConfigService {
         PORT: Number.parseInt(process.env?.S3_PORT || '9000'),
         USE_SSL: process.env?.S3_USE_SSL === 'true',
         REGION: process.env?.S3_REGION,
-        SKIP_POLICY: process.env?.S3_SKIP_POLICY === 'true',
+        SKIP_POLICY: process.env?.S3_SKIP_POLICY !== 'false',
         SAVE_VIDEO: process.env?.S3_SAVE_VIDEO === 'true',
       },
       AUTHENTICATION: {
         API_KEY: {
-          KEY: process.env.AUTHENTICATION_API_KEY || 'BQYHJGJHJ',
+          KEY: process.env.AUTHENTICATION_API_KEY || '',
         },
         EXPOSE_IN_FETCH_INSTANCES: process.env?.AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES === 'true',
       },

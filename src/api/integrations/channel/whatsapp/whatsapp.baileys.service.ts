@@ -645,7 +645,9 @@ export class BaileysStartupService extends ChannelStartupService {
         keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
-      generateHighQualityLinkPreview: true,
+      // Link previews fetch user-provided URLs from the server. Keep them disabled
+      // until the preview fetch path has a hardened SSRF-safe implementation.
+      generateHighQualityLinkPreview: false,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
@@ -1110,7 +1112,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
               console.log('requested placeholder resync, id=', messageId);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.debug(`Message received from phone for request id=${requestId}`);
             }
 
             if (text == 'onDemandHistSync') {
@@ -1891,7 +1893,10 @@ export class BaileysStartupService extends ChannelStartupService {
                 if (call.from.endsWith('@lid')) {
                   call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
                 }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+                const msg = await this.client.sendMessage(call.from, {
+                  text: settings.msgCall,
+                  linkPreview: false,
+                } as unknown as AnyMessageContent);
 
                 this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
               }
@@ -2131,7 +2136,6 @@ export class BaileysStartupService extends ChannelStartupService {
     sender: string,
     message: any,
     mentions: any,
-    linkPreview: any,
     quoted: any,
     messageId?: string,
     ephemeralExpiration?: number,
@@ -2139,6 +2143,10 @@ export class BaileysStartupService extends ChannelStartupService {
     // participants?: GroupParticipant[],
   ) {
     sender = sender.toLowerCase();
+
+    if (typeof message?.text === 'string' || typeof message?.conversation === 'string') {
+      message.linkPreview = false;
+    }
 
     const option: any = { quoted };
 
@@ -2200,7 +2208,8 @@ export class BaileysStartupService extends ChannelStartupService {
         {
           text: message['conversation'],
           mentions,
-          linkPreview: linkPreview,
+          // Do not let API callers trigger server-side URL fetches through Baileys.
+          linkPreview: false,
           contextInfo: message['contextInfo'],
         } as unknown as AnyMessageContent,
         option as unknown as MiscMessageGenerationOptions,
@@ -2338,8 +2347,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      const linkPreview = options?.linkPreview != false ? undefined : false;
-
+      // Baileys generates a preview (and fetches its URL) unless this is explicitly false.
+      // Ignore caller-provided linkPreview so this endpoint cannot be used for SSRF.
       let quoted: WAMessage;
 
       if (options?.quoted) {
@@ -2388,7 +2397,6 @@ export class BaileysStartupService extends ChannelStartupService {
           sender,
           message,
           mentions,
-          linkPreview,
           quoted,
           null,
           group?.ephemeralDuration,
@@ -2406,16 +2414,7 @@ export class BaileysStartupService extends ChannelStartupService {
           },
           disappearingMode: { initiator: 0 },
         };
-        messageSent = await this.sendMessage(
-          sender,
-          message,
-          mentions,
-          linkPreview,
-          quoted,
-          null,
-          undefined,
-          contextInfo,
-        );
+        messageSent = await this.sendMessage(sender, message, mentions, quoted, null, undefined, contextInfo);
       }
 
       if (Long.isLong(messageSent?.messageTimestamp)) {
@@ -2696,7 +2695,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       return {
-        content: { text: status.content },
+        content: { text: status.content, linkPreview: false },
         option: { backgroundColor: status.backgroundColor, font: status.font, statusJidList: status.statusJidList },
       };
     }
@@ -2829,7 +2828,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const response = await axios.get(mediaMessage.media, config);
 
-          mimetype = response.headers['content-type'];
+          const contentType = response.headers['content-type'];
+          mimetype = typeof contentType === 'string' ? contentType : false;
         }
       }
 
@@ -4138,15 +4138,15 @@ export class BaileysStartupService extends ChannelStartupService {
       const msg: any = await this.getMessage(data.key, true);
 
       if (msg?.messageType === 'conversation' || msg?.messageType === 'extendedTextMessage') {
-        return { text: data.text };
+        return { text: data.text, linkPreview: false };
       }
 
       if (msg?.messageType === 'imageMessage') {
-        return { image: msg?.message?.imageMessage, caption: data.text };
+        return { image: msg?.message?.imageMessage, caption: data.text, linkPreview: false };
       }
 
       if (msg?.messageType === 'videoMessage') {
-        return { video: msg?.message?.videoMessage, caption: data.text };
+        return { video: msg?.message?.videoMessage, caption: data.text, linkPreview: false };
       }
 
       return null;
@@ -4179,7 +4179,11 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: data.key });
+      const messageSent = await this.client.sendMessage(jid, {
+        ...(options as any),
+        linkPreview: false,
+        edit: data.key,
+      });
       if (messageSent) {
         const editedMessage =
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;

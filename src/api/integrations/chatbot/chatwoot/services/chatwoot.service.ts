@@ -25,13 +25,108 @@ import { sendTelemetry } from '@utils/sendTelemetry';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
+import { lookup as dnsLookup } from 'dns/promises';
 import FormData from 'form-data';
-import { Jimp, JimpMime } from 'jimp';
+import https from 'https';
+import * as ipaddr from 'ipaddr.js';
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import path from 'path';
+import sharp from 'sharp';
 import { Readable } from 'stream';
+
+const AD_THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024;
+const AD_THUMBNAIL_MAX_PIXELS = 20_000_000;
+const AD_THUMBNAIL_CONTENT_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+async function fetchExternalAdThumbnail(url: string): Promise<Buffer | null> {
+  let parsedUrl: URL;
+
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return null;
+  }
+
+  if (
+    parsedUrl.protocol !== 'https:' ||
+    (parsedUrl.port !== '' && parsedUrl.port !== '443') ||
+    parsedUrl.username !== '' ||
+    parsedUrl.password !== ''
+  ) {
+    return null;
+  }
+
+  const hostname = parsedUrl.hostname.toLowerCase().replace(/\.$/, '');
+  if (!hostname) return null;
+
+  let addresses: Awaited<ReturnType<typeof dnsLookup>>[];
+  try {
+    addresses = await dnsLookup(hostname, { all: true, verbatim: true });
+  } catch {
+    return null;
+  }
+
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address }) => !ipaddr.isValid(address) || ipaddr.process(address).range() !== 'unicast')
+  ) {
+    return null;
+  }
+
+  const pinnedLookup: any = (requestHostname: string, options: any, callback: any) => {
+    if (requestHostname.toLowerCase().replace(/\.$/, '') !== hostname) {
+      callback(new Error('Thumbnail host changed during request'));
+      return;
+    }
+
+    const matchingAddresses = options?.family ? addresses.filter(({ family }) => family === options.family) : addresses;
+    if (matchingAddresses.length === 0) {
+      callback(new Error('No validated address for thumbnail host family'));
+      return;
+    }
+
+    if (options?.all) {
+      callback(null, matchingAddresses);
+      return;
+    }
+
+    const address = matchingAddresses[0];
+    callback(null, address.address, address.family);
+  };
+
+  const agent = new https.Agent({ lookup: pinnedLookup, keepAlive: false, maxSockets: 1 });
+  try {
+    const response = await axios.get(parsedUrl.toString(), {
+      httpsAgent: agent,
+      proxy: false,
+      maxRedirects: 0,
+      timeout: 5000,
+      maxContentLength: AD_THUMBNAIL_MAX_BYTES,
+      maxBodyLength: AD_THUMBNAIL_MAX_BYTES,
+      responseType: 'arraybuffer',
+      validateStatus: (status) => status === 200,
+    });
+
+    const contentType = response.headers['content-type'];
+    const normalizedContentType =
+      typeof contentType === 'string' ? contentType.split(';', 1)[0].trim().toLowerCase() : '';
+    if (!AD_THUMBNAIL_CONTENT_TYPES.has(normalizedContentType)) return null;
+
+    const imageBuffer = Buffer.from(response.data);
+    if (imageBuffer.length === 0 || imageBuffer.length > AD_THUMBNAIL_MAX_BYTES) return null;
+
+    return await sharp(imageBuffer, { limitInputPixels: AD_THUMBNAIL_MAX_PIXELS, failOn: 'error' })
+      .resize(320, 180, { fit: 'cover' })
+      .png()
+      .toBuffer();
+  } catch {
+    return null;
+  } finally {
+    agent.destroy();
+  }
+}
 
 interface ChatwootMessage {
   messageId?: number;
@@ -1204,7 +1299,8 @@ export class ChatwootService {
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
         });
-        mimeType = response.headers['content-type'];
+        const contentType = response.headers['content-type'];
+        mimeType = typeof contentType === 'string' ? contentType : '';
       }
 
       let type = 'document';
@@ -2212,32 +2308,6 @@ export class ChatwootService {
 
         const isAdsMessage = (adsMessage && adsMessage.title) || adsMessage.body || adsMessage.thumbnailUrl;
         if (isAdsMessage) {
-          const imgBuffer = await axios.get(adsMessage.thumbnailUrl, { responseType: 'arraybuffer' });
-
-          const extension = mimeTypes.extension(imgBuffer.headers['content-type']);
-          const mimeType = extension && mimeTypes.lookup(extension);
-
-          if (!mimeType) {
-            this.logger.warn('mimetype of Ads message not found');
-            return;
-          }
-
-          const random = Math.random().toString(36).substring(7);
-          const nameFile = `${random}.${mimeTypes.extension(mimeType)}`;
-          const fileData = Buffer.from(imgBuffer.data, 'binary');
-
-          const img = await Jimp.read(fileData);
-          await img.cover({
-            w: 320,
-            h: 180,
-          });
-          const processedBuffer = await img.getBuffer(JimpMime.png);
-
-          const fileStream = new Readable();
-          fileStream._read = () => {}; // _read is required but you can noop it
-          fileStream.push(processedBuffer);
-          fileStream.push(null);
-
           const truncStr = (str: string, len: number) => {
             if (!str) return '';
 
@@ -2246,13 +2316,35 @@ export class ChatwootService {
 
           const title = truncStr(adsMessage.title, 40);
           const description = truncStr(adsMessage?.body, 75);
+          const adContent = `${bodyMessage}\n\n\n**${title}**\n${description}\n${adsMessage.sourceUrl}`;
+          const processedBuffer = adsMessage.thumbnailUrl
+            ? await fetchExternalAdThumbnail(adsMessage.thumbnailUrl)
+            : null;
+
+          if (!processedBuffer) {
+            this.logger.warn('External ad thumbnail skipped after safe-fetch validation');
+            return await this.createMessage(
+              instance,
+              getConversation,
+              adContent,
+              messageType,
+              false,
+              [],
+              body,
+              'WAID:' + body.key.id,
+              quotedMsg,
+            );
+          }
+
+          const nameFile = `${Math.random().toString(36).substring(7)}.png`;
+          const fileStream = Readable.from([processedBuffer]);
 
           const send = await this.sendData(
             getConversation,
             fileStream,
             nameFile,
             messageType,
-            `${bodyMessage}\n\n\n**${title}**\n${description}\n${adsMessage.sourceUrl}`,
+            adContent,
             instance,
             body,
             'WAID:' + body.key.id,
