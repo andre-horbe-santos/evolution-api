@@ -3,31 +3,38 @@ version: '3.3'
 services:
   postgres:
     container_name: postgres
-    image: postgres:15
+    image: postgres:15.13
     networks:
       - evolution-net
     command: ["postgres", "-c", "max_connections=1000"]
     restart: always
     ports:
-      - 5432:5432
+      - "127.0.0.1:5432:5432"
     environment:
-      - POSTGRES_PASSWORD=PASSWORD
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the environment}
+      POSTGRES_DB: ${POSTGRES_DB:-evolution}
+      # Use a dedicated non-superuser role. Example setup (run once as superuser):
+      #   CREATE ROLE evolution_app LOGIN PASSWORD '...';
+      #   GRANT CONNECT ON DATABASE evolution TO evolution_app;
+      #   GRANT USAGE, CREATE ON SCHEMA public TO evolution_app;
+      # Set POSTGRES_USER to evolution_app (or keep postgres only for initial setup).
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     expose:
       - 5432
 
   pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:8.14
     networks:
       - evolution-net
     environment:
-      - PGADMIN_DEFAULT_EMAIL=EMAIL
-      - PGADMIN_DEFAULT_PASSWORD=PASSWORD  
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:?Set PGADMIN_DEFAULT_EMAIL in the environment}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:?Set PGADMIN_DEFAULT_PASSWORD in the environment}
     volumes:
       - pgadmin_data:/var/lib/pgadmin
     ports:
-      - 4000:80
+      - "127.0.0.1:4000:80"
     links:
       - postgres
 
